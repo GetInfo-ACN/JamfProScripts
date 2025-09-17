@@ -1,11 +1,11 @@
 #!/bin/bash
 #
 # ConvertADToLocal-PreserveAdmin.sh
-# Purpose: Convert Active Directory mobile accounts to local accounts (preserve admin users)
+# Purpose: Convert current user's AD mobile account to local account (preserve admin users)
 # Author: Huseyin Usta - GetInfo ACN
 # Created: 2025
 # Description:
-#   - Converts AD mobile accounts to local accounts
+#   - Converts current user's AD mobile account to local account
 #   - Preserves user passwords and group memberships
 #   - Removes AD binding and cleans up AD attributes
 #   - Admin users remain admins (no demotion)
@@ -16,7 +16,6 @@
 ################################################################################
 
 Version="1.2"
-listUsers="$(/usr/bin/dscl . list /Users UniqueID | awk '$2 > 1000 {print $1}') FINISHED"
 FullScriptName=$(basename "$0")
 ShowVersion="$FullScriptName $Version"
 check4AD=$(/usr/bin/dscl localhost -list . | grep "Active Directory")
@@ -42,6 +41,20 @@ RunAsRoot() {
         log "***  This application must be run as root.  Please authenticate below.  ***"
         sudo "$1" && exit 0
     fi
+}
+
+# Get the active user
+GetCurrentUser() {
+    currentUser=$(stat -f%Su /dev/console)
+    
+    # Exit if no user or system user
+    if [[ -z "$currentUser" || "$currentUser" == "root" || "$currentUser" == "_mbsetupuser" ]]; then
+        log "No user logged in or setup user active, exiting."
+        exit 0
+    fi
+    
+    log "Current logged in user: $currentUser"
+    echo "$currentUser"
 }
 
 RemoveAD() {
@@ -101,6 +114,8 @@ SavePermissionState() {
         ls -le "$homedir" > "$backup_dir/$username.acls"
     fi
 }
+
+
 
 UpdatePermissions() {
     local username="$1"
@@ -175,18 +190,14 @@ ConvertUser() {
 # Main Program
 RunAsRoot "$0"
 
+# Get current user
+currentUser=$(GetCurrentUser)
+
 if [[ "$check4AD" == "Active Directory" ]]; then
     RemoveAD
 fi
 
-for netname in $listUsers; do
-    if [[ "$netname" == "FINISHED" ]]; then
-        log "Finished converting users to local accounts"
-        break
-    fi
-    
-    ConvertUser "$netname"
-done
+ConvertUser "$currentUser"
 
 log "Running Jamf recon to update inventory"
 if command -v jamf &> /dev/null; then
