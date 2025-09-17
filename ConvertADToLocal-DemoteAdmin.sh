@@ -11,11 +11,11 @@
 #   - Removes AD binding and cleans up AD attributes
 #   - Maintains FileVault compatibility
 #   - Logs all actions for audit trail
-# Version: v1.0
+# Version: v1.2
 #
 ################################################################################
 
-Version="1.0"
+Version="1.2"
 FullScriptName=$(basename "$0")
 ShowVersion="$FullScriptName $Version"
 check4AD=$(/usr/bin/dscl localhost -list . | grep "Active Directory")
