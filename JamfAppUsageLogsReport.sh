@@ -32,8 +32,8 @@
  
 # Server connection information
 URL="https://yourjamfserver.jamfcloud.com"
-userName="adminuser"
-password="adminpassword"
+userName='adminuser'
+password='adminpassword'
 
 # Date range
 startDate="2018-12-01"
