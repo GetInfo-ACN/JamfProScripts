@@ -36,8 +36,8 @@ userName='adminuser'
 password='adminpassword'
 
 # Date range
-startDate="2018-12-01"
-endDate="2025-02-25"
+startDate='2018-12-01'
+endDate='2025-02-25'
 
 # Timestamp for CSV file
 timestamp=$(date +"%Y-%m-%d")
