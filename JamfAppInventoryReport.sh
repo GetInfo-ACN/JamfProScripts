@@ -28,8 +28,8 @@
 
 # Server connection information
 URL="https://yourjamfserver.jamfcloud.com"
-userName="adminuser"
-password="adminpassword"
+userName='adminuser'
+password='adminpassword'
 
 # Timestamp for CSV file
 timestamp=$(date +"%Y-%m-%d")
