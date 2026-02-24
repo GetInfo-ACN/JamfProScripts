@@ -11,11 +11,11 @@
 #   - Removes AD binding and cleans up AD attributes
 #   - Maintains FileVault compatibility
 #   - Logs all actions for audit trail
-# Version: v1.2
+# Version: v1.6
 #
 ################################################################################
 
-Version="1.2"
+Version="1.6"
 FullScriptName=$(basename "$0")
 ShowVersion="$FullScriptName $Version"
 check4AD=$(/usr/bin/dscl localhost -list . | grep "Active Directory")
@@ -47,20 +47,18 @@ RunAsRoot() {
 # Get the active user
 GetCurrentUser() {
     currentUser=$(stat -f%Su /dev/console)
-    
-    # Exit if no user or system user
+
     if [[ -z "$currentUser" || "$currentUser" == "root" || "$currentUser" == "_mbsetupuser" ]]; then
         log "No user logged in or setup user active, exiting."
         exit 0
     fi
-    
+
     log "Current logged in user: $currentUser"
-    echo "$currentUser"
 }
 
 RemoveAD() {
     log "Removing Active Directory binding..."
-    searchPath=$(/usr/bin/dscl /Search -read . CSPSearchPath | grep Active\ Directory | sed 's/^ //')
+    searchPath=$(/usr/bin/dscl /Search -read . CSPSearchPath | grep "Active Directory" | sed 's/^ //')
     /usr/sbin/dsconfigad -remove -force -u none -p none
     /usr/bin/dscl /Search/Contacts -delete . CSPSearchPath "$searchPath"
     /usr/bin/dscl /Search -delete . CSPSearchPath "$searchPath"
@@ -72,43 +70,43 @@ RemoveAD() {
 PasswordMigration() {
     local username="$1"
     log "Migrating password for $username..."
-    
-    AuthenticationAuthority=$(/usr/bin/dscl -plist . -read /Users/$username AuthenticationAuthority)
+
+    AuthenticationAuthority=$(/usr/bin/dscl -plist . -read /Users/"$username" AuthenticationAuthority)
     Kerberosv5=$(echo "$AuthenticationAuthority" | xmllint --xpath 'string(//string[contains(text(),"Kerberosv5")])' -)
     LocalCachedUser=$(echo "$AuthenticationAuthority" | xmllint --xpath 'string(//string[contains(text(),"LocalCachedUser")])' -)
-    
-    if [[ ! -z "$Kerberosv5" ]]; then
-        /usr/bin/dscl -plist . -delete /Users/$username AuthenticationAuthority "$Kerberosv5"
+
+    # Sadece AD girislerini temizle, ShadowHash'e hic dokunma
+    # macOS 14+ uzerinde delete/create dongusu silent failure verebilir
+    if [[ -n "$Kerberosv5" ]]; then
+        log "Removing Kerberosv5 entry"
+        /usr/bin/dscl -plist . -delete /Users/"$username" AuthenticationAuthority "$Kerberosv5"
     fi
-    
-    if [[ ! -z "$LocalCachedUser" ]]; then
-        /usr/bin/dscl -plist . -delete /Users/$username AuthenticationAuthority "$LocalCachedUser"
+
+    if [[ -n "$LocalCachedUser" ]]; then
+        log "Removing LocalCachedUser entry"
+        /usr/bin/dscl -plist . -delete /Users/"$username" AuthenticationAuthority "$LocalCachedUser"
     fi
-    
-    shadowhash=$(/usr/bin/dscl . -read /Users/$username AuthenticationAuthority | grep " ;ShadowHash;HASHLIST:<")
-    if [[ -n "$shadowhash" ]]; then
-        log "Preserving password hash for $username"
-        /usr/bin/dscl . -delete /Users/$username AuthenticationAuthority
-        /usr/bin/dscl . -create /Users/$username AuthenticationAuthority "$shadowhash"
-    fi
+
+    log "Password migration complete - ShadowHash preserved in place"
 }
 
 SavePermissionState() {
     local username="$1"
     local homedir="$2"
-    
+
     log "Saving permission state for $username"
-    local groups=$(id -Gn "$username" | tr ' ' '\n' | sort)
+    local groups
+    groups=$(id -Gn "$username" | tr ' ' '\n' | sort)
     mkdir -p "$backup_dir"
     echo "$groups" > "$backup_dir/$username.groups"
-    
+
     if dseditgroup -o checkmember -m "$username" admin > /dev/null 2>&1; then
         log "$username has admin privileges, this will be REMOVED"
         touch "$backup_dir/$username.admin.removed"
     else
         log "$username does not have admin privileges"
     fi
-    
+
     if [[ -d "$homedir" ]]; then
         log "Saving ACLs for $homedir"
         ls -le "$homedir" > "$backup_dir/$username.acls"
@@ -117,7 +115,7 @@ SavePermissionState() {
 
 DemoteFromAdmin() {
     local username="$1"
-    
+
     if dseditgroup -o checkmember -m "$username" admin &>/dev/null; then
         log "$username is an admin. Removing from admin group..."
         if dseditgroup -o edit -d "$username" -t user admin; then
@@ -134,22 +132,40 @@ DemoteFromAdmin() {
 UpdatePermissions() {
     local username="$1"
     local homedir="$2"
-    
+
     if [[ -n "$homedir" && -d "$homedir" ]]; then
         log "Updating home folder permissions for $username"
-        /usr/sbin/chown -R "$username" "$homedir"
+
+        # Username yerine UID kullan - opendirectoryd restart sonrasi username henuz taninamayabilir
+        local userUID
+        userUID=$(/usr/bin/dscl . -read /Users/"$username" UniqueID 2>/dev/null | awk '{print $2}')
+        if [[ -n "$userUID" ]]; then
+            /usr/sbin/chown -R "$userUID" "$homedir"
+            log "Home folder ownership updated with UID: $userUID"
+        else
+            log "WARNING: Could not get UID for $username, skipping chown"
+        fi
+
         log "Adding $username to the staff group"
         /usr/sbin/dseditgroup -o edit -a "$username" -t user staff
-        
+
+        # Sadece local gruplari restore et, AD gruplarini atla
         if [[ -f "$backup_dir/$username.groups" ]]; then
-            while read group; do
-                if [[ -n "$group" && "$group" != "staff" && "$group" != "admin" ]]; then
+            while read -r group; do
+                if [[ -n "$group" \
+                    && "$group" != "staff" \
+                    && "$group" != "admin" \
+                    && "$group" != *"\\"* \
+                    && "$group" != "CNF:"* \
+                    && "$group" != "{"*"}"* ]]; then
                     log "Restoring group: $group for $username"
                     /usr/sbin/dseditgroup -o edit -a "$username" -t user "$group" 2>/dev/null
+                else
+                    log "Skipping AD/invalid group: $group"
                 fi
             done < "$backup_dir/$username.groups"
         fi
-        
+
         log "User and group info for $username:"
         /usr/bin/id "$username"
     else
@@ -159,63 +175,68 @@ UpdatePermissions() {
 
 ConvertAndDemoteUser() {
     local username="$1"
-    
-    accounttype=$(/usr/bin/dscl . -read /Users/"$username" AuthenticationAuthority | head -2 | awk -F'/' '{print $2}' | tr -d '\n')
-    if [[ "$accounttype" != "Active Directory" ]]; then
+
+    if ! /usr/bin/dscl . -read /Users/"$username" AuthenticationAuthority 2>/dev/null | grep -q "Active Directory"; then
         log "$username is not an AD mobile account"
-        # Still demote if user is admin
         DemoteFromAdmin "$username"
         return
     fi
-    
+
     log "$username is an AD mobile account. Converting to a local account and removing admin privileges."
     homedir=$(/usr/bin/dscl . -read /Users/"$username" NFSHomeDirectory | awk '{print $2}')
-    
+
     SavePermissionState "$username" "$homedir"
-    
+
     if fdesetup list | grep -q "$username"; then
         log "$username has FileVault access"
     fi
-    
+
     log "Removing AD attributes for $username"
-    /usr/bin/dscl . -delete /Users/$username cached_groups
-    /usr/bin/dscl . -delete /Users/$username cached_auth_policy
-    /usr/bin/dscl . -delete /Users/$username CopyTimestamp
-    /usr/bin/dscl . -delete /Users/$username AltSecurityIdentities
-    /usr/bin/dscl . -delete /Users/$username SMBPrimaryGroupSID
-    /usr/bin/dscl . -delete /Users/$username OriginalAuthenticationAuthority
-    /usr/bin/dscl . -delete /Users/$username OriginalNodeName
-    /usr/bin/dscl . -delete /Users/$username SMBSID
-    /usr/bin/dscl . -delete /Users/$username SMBScriptPath
-    /usr/bin/dscl . -delete /Users/$username SMBPasswordLastSet
-    /usr/bin/dscl . -delete /Users/$username SMBGroupRID
-    /usr/bin/dscl . -delete /Users/$username PrimaryNTDomain
-    /usr/bin/dscl . -delete /Users/$username AppleMetaRecordName
-    /usr/bin/dscl . -delete /Users/$username MCXSettings
-    /usr/bin/dscl . -delete /Users/$username MCXFlags
-    
+    /usr/bin/dscl . -delete /Users/"$username" cached_groups 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" cached_auth_policy 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" CopyTimestamp 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" AltSecurityIdentities 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" SMBPrimaryGroupSID 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" OriginalAuthenticationAuthority 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" OriginalNodeName 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" SMBSID 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" SMBScriptPath 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" SMBPasswordLastSet 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" SMBGroupRID 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" PrimaryNTDomain 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" AppleMetaRecordName 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" MCXSettings 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" MCXFlags 2>/dev/null
+
+    # Sadece Kerberos ve LocalCachedUser temizle, ShadowHash'e dokunma
     PasswordMigration "$username"
+
     log "Restarting directory services"
     /usr/bin/killall opendirectoryd
-    sleep 20
-    
+
+    until pgrep opendirectoryd > /dev/null; do
+        sleep 1
+    done
+    sleep 2
+    log "Directory services restarted"
+
     UpdatePermissions "$username" "$homedir"
-    
-    # Demote user from admin after conversion
     DemoteFromAdmin "$username"
 }
 
 # Main Program
 RunAsRoot "$0"
 
-# Get current user
-currentUser=$(GetCurrentUser)
+# Current user'i al
+GetCurrentUser
 
+# Once convert et ve demote et
+ConvertAndDemoteUser "$currentUser"
+
+# En son AD binding'i kaldir
 if [[ "$check4AD" == "Active Directory" ]]; then
     RemoveAD
 fi
-
-ConvertAndDemoteUser "$currentUser"
 
 log "Running Jamf recon to update inventory"
 if command -v jamf &> /dev/null; then
