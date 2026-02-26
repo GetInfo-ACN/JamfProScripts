@@ -11,11 +11,11 @@
 #   - Removes AD binding and cleans up AD attributes
 #   - Maintains FileVault compatibility
 #   - Logs all actions for audit trail
-# Version: v1.6
+# Version: v1.9
 #
 ################################################################################
 
-Version="1.6"
+Version="1.9"
 FullScriptName=$(basename "$0")
 ShowVersion="$FullScriptName $Version"
 check4AD=$(/usr/bin/dscl localhost -list . | grep "Active Directory")
@@ -140,7 +140,7 @@ UpdatePermissions() {
         local userUID
         userUID=$(/usr/bin/dscl . -read /Users/"$username" UniqueID 2>/dev/null | awk '{print $2}')
         if [[ -n "$userUID" ]]; then
-            /usr/sbin/chown -R "$userUID" "$homedir"
+            /usr/sbin/chown -R "$userUID":20 "$homedir"
             log "Home folder ownership updated with UID: $userUID"
         else
             log "WARNING: Could not get UID for $username, skipping chown"
@@ -176,8 +176,9 @@ UpdatePermissions() {
 ConvertAndDemoteUser() {
     local username="$1"
 
-    if ! /usr/bin/dscl . -read /Users/"$username" AuthenticationAuthority 2>/dev/null | grep -q "Active Directory"; then
-        log "$username is not an AD mobile account"
+    # AD mobile account detection (SMBSID based - more reliable)
+    if ! /usr/bin/dscl . -read /Users/"$username" SMBSID &>/dev/null; then
+        log "$username is not an AD mobile account (no SMBSID found)"
         DemoteFromAdmin "$username"
         return
     fi
@@ -187,7 +188,7 @@ ConvertAndDemoteUser() {
 
     SavePermissionState "$username" "$homedir"
 
-    if fdesetup list | grep -q "$username"; then
+    if /usr/bin/fdesetup list 2>/dev/null | awk -F, '{print $1}' | grep -qx "$username"; then
         log "$username has FileVault access"
     fi
 
@@ -219,6 +220,17 @@ ConvertAndDemoteUser() {
     done
     sleep 2
     log "Directory services restarted"
+
+    # Primary group'u AD GID'den staff (20) olarak degistir
+    local currentGID
+    currentGID=$(/usr/bin/dscl . -read /Users/"$username" PrimaryGroupID 2>/dev/null | awk '{print $2}')
+    if [[ -n "$currentGID" && "$currentGID" != "20" ]]; then
+        log "Changing primary group from GID $currentGID to staff (20)"
+        /usr/bin/dscl . -change /Users/"$username" PrimaryGroupID "$currentGID" 20
+        log "Primary group updated to staff"
+    else
+        log "Primary group already set to staff"
+    fi
 
     UpdatePermissions "$username" "$homedir"
     DemoteFromAdmin "$username"
