@@ -11,11 +11,11 @@
 #   - Removes AD binding and cleans up AD attributes
 #   - Maintains FileVault compatibility
 #   - Logs all actions for audit trail
-# Version: v1.9
+# Version: v1.5
 #
 ################################################################################
 
-Version="1.9"
+Version="1.5"
 FullScriptName=$(basename "$0")
 ShowVersion="$FullScriptName $Version"
 check4AD=$(/usr/bin/dscl localhost -list . | grep "Active Directory")
@@ -75,8 +75,8 @@ PasswordMigration() {
     Kerberosv5=$(echo "$AuthenticationAuthority" | xmllint --xpath 'string(//string[contains(text(),"Kerberosv5")])' -)
     LocalCachedUser=$(echo "$AuthenticationAuthority" | xmllint --xpath 'string(//string[contains(text(),"LocalCachedUser")])' -)
 
-    # Sadece AD girislerini temizle, ShadowHash'e hic dokunma
-    # macOS 14+ uzerinde delete/create dongusu silent failure verebilir
+    # Only remove AD-specific entries, do not touch ShadowHash
+    # macOS 14+ delete/create cycle can cause silent failure
     if [[ -n "$Kerberosv5" ]]; then
         log "Removing Kerberosv5 entry"
         /usr/bin/dscl -plist . -delete /Users/"$username" AuthenticationAuthority "$Kerberosv5"
@@ -136,7 +136,7 @@ UpdatePermissions() {
     if [[ -n "$homedir" && -d "$homedir" ]]; then
         log "Updating home folder permissions for $username"
 
-        # Username yerine UID kullan - opendirectoryd restart sonrasi username henuz taninamayabilir
+        # Use UID instead of username - opendirectoryd may not recognize username immediately after restart
         local userUID
         userUID=$(/usr/bin/dscl . -read /Users/"$username" UniqueID 2>/dev/null | awk '{print $2}')
         if [[ -n "$userUID" ]]; then
@@ -149,7 +149,7 @@ UpdatePermissions() {
         log "Adding $username to the staff group"
         /usr/sbin/dseditgroup -o edit -a "$username" -t user staff
 
-        # Sadece local gruplari restore et, AD gruplarini atla
+        # Restore only local groups, skip AD groups
         if [[ -f "$backup_dir/$username.groups" ]]; then
             while read -r group; do
                 if [[ -n "$group" \
@@ -209,7 +209,7 @@ ConvertAndDemoteUser() {
     /usr/bin/dscl . -delete /Users/"$username" MCXSettings 2>/dev/null
     /usr/bin/dscl . -delete /Users/"$username" MCXFlags 2>/dev/null
 
-    # Sadece Kerberos ve LocalCachedUser temizle, ShadowHash'e dokunma
+    # Only remove Kerberos and LocalCachedUser entries, do not touch ShadowHash
     PasswordMigration "$username"
 
     log "Restarting directory services"
@@ -221,7 +221,7 @@ ConvertAndDemoteUser() {
     sleep 2
     log "Directory services restarted"
 
-    # Primary group'u AD GID'den staff (20) olarak degistir
+    # Change primary group from AD GID to staff (20)
     local currentGID
     currentGID=$(/usr/bin/dscl . -read /Users/"$username" PrimaryGroupID 2>/dev/null | awk '{print $2}')
     if [[ -n "$currentGID" && "$currentGID" != "20" ]]; then
@@ -239,13 +239,13 @@ ConvertAndDemoteUser() {
 # Main Program
 RunAsRoot "$0"
 
-# Current user'i al
+# Get current user
 GetCurrentUser
 
-# Once convert et ve demote et
+# Convert and demote user first
 ConvertAndDemoteUser "$currentUser"
 
-# En son AD binding'i kaldir
+# Remove AD binding last
 if [[ "$check4AD" == "Active Directory" ]]; then
     RemoveAD
 fi
