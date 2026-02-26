@@ -8,36 +8,57 @@
 #   - Detects the active console user
 #   - Exits if system users or no user is logged in
 #   - Removes the user from the admin group if they are currently an admin
-#   - Logs actions to Jamf/system logs with distinct tags
-# Version: v1.0
+#   - Logs all actions for audit trail
+# Version: v1.1
 #
 ################################################################################
 
-export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+Version="1.1"
+FullScriptName=$(basename "$0")
+ShowVersion="$FullScriptName $Version"
+logFile="/private/var/log/admin.demote.log"
+
+# Log function
+log() {
+    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    local message="$timestamp - $1"
+    echo "$message" | tee -a "$logFile"
+    logger -t "JamfDemoteScript" "$message"
+}
+
+log "********* Running $ShowVersion *********"
+
+RunAsRoot() {
+    if [[ "${USER}" != "root" ]]; then
+        log "***  This application must be run as root.  Please authenticate below.  ***"
+        sudo "$1" && exit 0
+    fi
+}
+
+RunAsRoot "$0"
 
 # Get the active user
 currentUser=$(stat -f%Su /dev/console)
 
 # Exit if no user or system user
 if [[ -z "$currentUser" || "$currentUser" == "root" || "$currentUser" == "_mbsetupuser" ]]; then
-    echo "No user logged in or setup user active, exiting."
+    log "No user logged in or setup user active, exiting."
     exit 0
 fi
 
-echo "Current logged in user: $currentUser"
+log "Current logged in user: $currentUser"
 
 # Check if the user is an admin
-if dseditgroup -o checkmember -m "$currentUser" admin &>/dev/null; then
-    echo "$currentUser is an admin. Removing from admin group..."
-    if dseditgroup -o edit -d "$currentUser" -t user admin; then
-        echo "Successfully removed $currentUser from admin group."
-        # Use distinct log tag for demote script
-        logger -t "JamfDemoteScript" "$(date): Successfully removed $currentUser from admin group"
+if /usr/sbin/dseditgroup -o checkmember -m "$currentUser" admin &>/dev/null; then
+    log "$currentUser is an admin. Removing from admin group..."
+    if /usr/sbin/dseditgroup -o edit -d "$currentUser" -t user admin; then
+        log "Successfully removed $currentUser from admin group."
     else
-        echo "Failed to remove $currentUser from admin group."
-        logger -t "JamfDemoteScript" "$(date): Failed to remove $currentUser from admin group"
+        log "Failed to remove $currentUser from admin group."
         exit 1
     fi
 else
-    echo "$currentUser is not an admin. Nothing to do."
+    log "$currentUser is not an admin. Nothing to do."
 fi
+
+exit 0
