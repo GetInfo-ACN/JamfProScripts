@@ -11,11 +11,15 @@
 #   - Admin users remain admins (no demotion)
 #   - Maintains FileVault compatibility
 #   - Logs all actions for audit trail
-# Version: v1.5
+# Version: v1.6
+# Changelog:
+#   v1.6 - PasswordMigration: remove ALL Kerberosv5 entries (AD + LKDC)
+#          Previously xpath 'string(...)' only matched the first entry,
+#          leaving LKDC Kerberosv5 in place which caused login failure after restart.
 #
 ################################################################################
 
-Version="1.5"
+Version="1.6"
 FullScriptName=$(basename "$0")
 ShowVersion="$FullScriptName $Version"
 check4AD=$(/usr/bin/dscl localhost -list . | grep "Active Directory")
@@ -72,20 +76,27 @@ PasswordMigration() {
     log "Migrating password for $username..."
 
     AuthenticationAuthority=$(/usr/bin/dscl -plist . -read /Users/"$username" AuthenticationAuthority)
-    Kerberosv5=$(echo "$AuthenticationAuthority" | xmllint --xpath 'string(//string[contains(text(),"Kerberosv5")])' -)
+
+    # Remove LocalCachedUser entry
     LocalCachedUser=$(echo "$AuthenticationAuthority" | xmllint --xpath 'string(//string[contains(text(),"LocalCachedUser")])' -)
-
-    # Only remove AD-specific entries, do not touch ShadowHash
-    # macOS 14+ delete/create cycle can cause silent failure
-    if [[ -n "$Kerberosv5" ]]; then
-        log "Removing Kerberosv5 entry"
-        /usr/bin/dscl -plist . -delete /Users/"$username" AuthenticationAuthority "$Kerberosv5"
-    fi
-
     if [[ -n "$LocalCachedUser" ]]; then
         log "Removing LocalCachedUser entry"
         /usr/bin/dscl -plist . -delete /Users/"$username" AuthenticationAuthority "$LocalCachedUser"
     fi
+
+    # Remove ALL Kerberosv5 entries (AD Kerberos and LKDC)
+    # Previously xpath 'string(...)' only matched the first entry,
+    # leaving LKDC Kerberosv5 in place which caused password rejection after restart.
+    while IFS= read -r entry; do
+        if [[ -n "$entry" ]]; then
+            log "Removing Kerberosv5 entry: $entry"
+            /usr/bin/dscl -plist . -delete /Users/"$username" AuthenticationAuthority "$entry"
+        fi
+    done < <(echo "$AuthenticationAuthority" \
+        | xmllint --xpath '//string[contains(text(),"Kerberosv5")]' - 2>/dev/null \
+        | sed 's/<\/string>/\n/g' \
+        | sed 's/<string>//g' \
+        | grep -v '^$')
 
     log "Password migration complete - ShadowHash preserved in place"
 }
