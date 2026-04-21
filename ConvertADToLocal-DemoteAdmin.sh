@@ -1,34 +1,37 @@
 #!/bin/bash
 #
 # ConvertADToLocal-DemoteAdmin.sh
-# Purpose: Convert current user's AD mobile account to local account (preserve admin rights)
+# Purpose: Convert current user's AD mobile account to local account (demote admin to standard)
 # Author: Huseyin Usta - GetInfo ACN
 # Created: 2025
 # Description:
 #   - Converts current user's AD mobile account to local account
 #   - Preserves user passwords and essential group memberships
 #   - Removes AD binding and cleans up AD attributes
-#   - Admin users remain admins (no demotion)
+#   - Admin users are demoted to standard user
 #   - Maintains FileVault compatibility
 #   - Logs all actions for audit trail
-# Version: v1.7
+# Version: v1.6
 # Changelog:
-#   v1.7 - Removed admin demotion logic (admin rights preserved)
-#          PasswordMigration updated to remove ALL Kerberosv5 entries (v1.6 logic)
+#   v1.6 - PasswordMigration: remove ALL Kerberosv5 entries (AD + LKDC)
+#          Previously xpath 'string(...)' only matched the first entry,
+#          leaving LKDC Kerberosv5 in place which caused login failure after restart.
 #
 ################################################################################
 
-Version="1.7"
+Version="1.6"
 FullScriptName=$(basename "$0")
 ShowVersion="$FullScriptName $Version"
 check4AD=$(/usr/bin/dscl localhost -list . | grep "Active Directory")
 logFile="/private/var/log/mobile.to.local.log"
 backup_dir="/var/root/user_backups"
 
+# Determine OS version
 OLDIFS=$IFS
 IFS='.' read osvers_major osvers_minor osvers_dot_version <<< "$(/usr/bin/sw_vers -productVersion)"
 IFS=$OLDIFS
 
+# Log function
 log() {
     local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
     local message="$timestamp - $1"
@@ -45,6 +48,7 @@ RunAsRoot() {
     fi
 }
 
+# Get the active user
 GetCurrentUser() {
     currentUser=$(stat -f%Su /dev/console)
 
@@ -73,12 +77,16 @@ PasswordMigration() {
 
     AuthenticationAuthority=$(/usr/bin/dscl -plist . -read /Users/"$username" AuthenticationAuthority)
 
+    # Remove LocalCachedUser entry
     LocalCachedUser=$(echo "$AuthenticationAuthority" | xmllint --xpath 'string(//string[contains(text(),"LocalCachedUser")])' -)
     if [[ -n "$LocalCachedUser" ]]; then
         log "Removing LocalCachedUser entry"
         /usr/bin/dscl -plist . -delete /Users/"$username" AuthenticationAuthority "$LocalCachedUser"
     fi
 
+    # Remove ALL Kerberosv5 entries (AD Kerberos and LKDC)
+    # Previously xpath 'string(...)' only matched the first entry,
+    # leaving LKDC Kerberosv5 in place which caused password rejection after restart.
     while IFS= read -r entry; do
         if [[ -n "$entry" ]]; then
             log "Removing Kerberosv5 entry: $entry"
@@ -90,7 +98,7 @@ PasswordMigration() {
         | sed 's/<string>//g' \
         | grep -v '^$')
 
-    log "Password migration complete - ShadowHash preserved"
+    log "Password migration complete - ShadowHash preserved in place"
 }
 
 SavePermissionState() {
@@ -102,6 +110,12 @@ SavePermissionState() {
     groups=$(id -Gn "$username" | tr ' ' '\n' | sort)
     mkdir -p "$backup_dir"
     echo "$groups" > "$backup_dir/$username.groups"
+
+    if dseditgroup -o checkmember -m "$username" admin > /dev/null 2>&1; then
+        log "$username has admin privileges, will be preserved via group restore"
+    else
+        log "$username does not have admin privileges"
+    fi
 
     if [[ -d "$homedir" ]]; then
         log "Saving ACLs for $homedir"
@@ -116,15 +130,21 @@ UpdatePermissions() {
     if [[ -n "$homedir" && -d "$homedir" ]]; then
         log "Updating home folder permissions for $username"
 
+        # Use UID instead of username - opendirectoryd may not recognize username immediately after restart
         local userUID
         userUID=$(/usr/bin/dscl . -read /Users/"$username" UniqueID 2>/dev/null | awk '{print $2}')
         if [[ -n "$userUID" ]]; then
             /usr/sbin/chown -R "$userUID":20 "$homedir"
             log "Home folder ownership updated with UID: $userUID"
+        else
+            log "WARNING: Could not get UID for $username, skipping chown"
         fi
 
+        log "Adding $username to the staff group"
         /usr/sbin/dseditgroup -o edit -a "$username" -t user staff
 
+        # Restore only local groups, skip AD groups
+        # Admin group is included - admin users will remain admin
         if [[ -f "$backup_dir/$username.groups" ]]; then
             while read -r group; do
                 if [[ -n "$group" \
@@ -132,58 +152,111 @@ UpdatePermissions() {
                     && "$group" != *"\\"* \
                     && "$group" != "CNF:"* \
                     && "$group" != "{"*"}"* ]]; then
-                    log "Restoring group: $group"
+                    log "Restoring group: $group for $username"
                     /usr/sbin/dseditgroup -o edit -a "$username" -t user "$group" 2>/dev/null
+                else
+                    log "Skipping AD/invalid group: $group"
                 fi
             done < "$backup_dir/$username.groups"
         fi
 
-        # ensure admin (safety)
-        if dseditgroup -o checkmember -m "$username" admin >/dev/null 2>&1; then
-            log "$username is admin (confirmed)"
+        # Demote from admin group if member
+        if dseditgroup -o checkmember -m "$username" admin > /dev/null 2>&1; then
+            log "Removing $username from admin group"
+            /usr/sbin/dseditgroup -o edit -d "$username" -t user admin
+            log "$username demoted to standard user"
         else
-            log "Re-adding $username to admin group (safety)"
-            /usr/sbin/dseditgroup -o edit -a "$username" -t user admin
+            log "$username is not an admin. Nothing to demote."
         fi
 
+        log "User and group info for $username:"
         /usr/bin/id "$username"
+    else
+        log "Home directory not found for $username"
     fi
 }
 
 ConvertUser() {
     local username="$1"
 
+    # AD mobile account detection (SMBSID based - more reliable)
     if ! /usr/bin/dscl . -read /Users/"$username" SMBSID &>/dev/null; then
-        log "$username is not an AD mobile account"
+        log "$username is not an AD mobile account (no SMBSID found)"
         return
     fi
 
-    log "$username is an AD mobile account. Converting..."
+    log "$username is an AD mobile account. Converting to a local account."
     homedir=$(/usr/bin/dscl . -read /Users/"$username" NFSHomeDirectory | awk '{print $2}')
 
     SavePermissionState "$username" "$homedir"
 
-    /usr/bin/dscl . -delete /Users/"$username" SMBSID 2>/dev/null
+    if /usr/bin/fdesetup list 2>/dev/null | awk -F, '{print $1}' | grep -qx "$username"; then
+        log "$username has FileVault access"
+    fi
 
+    log "Removing AD attributes for $username"
+    /usr/bin/dscl . -delete /Users/"$username" cached_groups 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" cached_auth_policy 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" CopyTimestamp 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" AltSecurityIdentities 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" SMBPrimaryGroupSID 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" OriginalAuthenticationAuthority 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" OriginalNodeName 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" SMBSID 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" SMBScriptPath 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" SMBPasswordLastSet 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" SMBGroupRID 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" PrimaryNTDomain 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" AppleMetaRecordName 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" MCXSettings 2>/dev/null
+    /usr/bin/dscl . -delete /Users/"$username" MCXFlags 2>/dev/null
+
+    # Only remove Kerberos and LocalCachedUser entries, do not touch ShadowHash
     PasswordMigration "$username"
 
+    log "Restarting directory services"
     /usr/bin/killall opendirectoryd
+
+    until pgrep opendirectoryd > /dev/null; do
+        sleep 1
+    done
     sleep 2
+    log "Directory services restarted"
+
+    # Change primary group from AD GID to staff (20)
+    local currentGID
+    currentGID=$(/usr/bin/dscl . -read /Users/"$username" PrimaryGroupID 2>/dev/null | awk '{print $2}')
+    if [[ -n "$currentGID" && "$currentGID" != "20" ]]; then
+        log "Changing primary group from GID $currentGID to staff (20)"
+        /usr/bin/dscl . -change /Users/"$username" PrimaryGroupID "$currentGID" 20
+        log "Primary group updated to staff"
+    else
+        log "Primary group already set to staff"
+    fi
 
     UpdatePermissions "$username" "$homedir"
 }
 
+# Main Program
 RunAsRoot "$0"
+
+# Get current user
 GetCurrentUser
+
+# Convert user first
 ConvertUser "$currentUser"
 
+# Remove AD binding last
 if [[ "$check4AD" == "Active Directory" ]]; then
     RemoveAD
 fi
 
+log "Running Jamf recon to update inventory"
 if command -v jamf &> /dev/null; then
-    jamf recon
+    sudo jamf recon
+else
+    log "Jamf binary not found, skipping inventory update"
 fi
 
-log "Script completed successfully"
+log "Script completed successfully - $currentUser converted to local account and demoted from admin"
 exit 0
