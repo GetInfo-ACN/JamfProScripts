@@ -20,6 +20,8 @@
 # v1.0 - Initial Release
 # v2.0 - Added version column, shows each version separately
 # v3.0 - Migrated to Jamf Pro API v1 with OAuth 2.0 Client Credentials authentication (replaced Basic Auth)
+# v4.0 - Fixed pagination bug: computer list was silently capped at 100 (API default page-size).
+#        Now loops through all pages so every managed computer is included, regardless of fleet size.
 #
 ################################################################################
 #
@@ -64,15 +66,28 @@ echo "OAuth token obtained successfully"
 echo "Computer Name,Application Name,Version" > "$outputFile"
 
 # Get only managed computers
+# NOTE: Jamf Pro API paginates results (default page-size=100), so we must loop through
+# all pages to retrieve every managed computer, no matter how large the fleet is.
 echo "Fetching managed computer list..."
-computers_list=$(curl "$URL/api/v1/computers-inventory?filter=general.remoteManagement.managed==true" \
-  --silent \
-  --header "Authorization: Bearer $bearer_token" \
-  --header "Accept: application/json")
 
-# Extract computer IDs - Jamf Pro API v1 JSON format: {"totalCount": X, "results": [{"id": 123, ...}, ...]}
-# Parse JSON using Python (default on macOS)
-computer_ids=$(echo "$computers_list" | /usr/bin/python3 -c "
+computer_ids=""
+actual_count=""
+page=0
+page_size=200
+
+while :; do
+    page_response=$(curl "$URL/api/v1/computers-inventory?filter=general.remoteManagement.managed==true&page=${page}&page-size=${page_size}&sort=id:asc" \
+      --silent \
+      --header "Authorization: Bearer $bearer_token" \
+      --header "Accept: application/json")
+
+    if [[ -z "$actual_count" ]]; then
+        actual_count=$(echo "$page_response" | grep -o '"totalCount" : [0-9]*' | grep -o '[0-9]*')
+    fi
+
+    # Extract computer IDs - Jamf Pro API v1 JSON format: {"totalCount": X, "results": [{"id": 123, ...}, ...]}
+    # Parse JSON using Python (default on macOS)
+    page_ids=$(echo "$page_response" | /usr/bin/python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -81,17 +96,33 @@ try:
         print('\n'.join(ids))
 except:
     pass
-" 2>/dev/null | sort -u)
+" 2>/dev/null)
 
-# Fallback if Python fails: simple regex (only first IDs in results array)
-if [[ -z "$computer_ids" ]] || [[ $(echo "$computer_ids" | wc -l | tr -d ' ') -eq 0 ]]; then
-    # Find results array and process only that section
-    results_start=$(echo "$computers_list" | grep -n '"results"' | head -1 | cut -d: -f1)
-    if [[ -n "$results_start" ]]; then
-        computer_ids=$(echo "$computers_list" | sed -n "${results_start},\$p" | grep -oE '"id"\s*:\s*[0-9]+' | head -100 | grep -oE '[0-9]+$' | sort -u)
+    # Fallback if Python fails: simple regex (only IDs in this page's results array)
+    if [[ -z "$page_ids" ]]; then
+        results_start=$(echo "$page_response" | grep -n '"results"' | head -1 | cut -d: -f1)
+        if [[ -n "$results_start" ]]; then
+            page_ids=$(echo "$page_response" | sed -n "${results_start},\$p" | grep -oE '"id"\s*:\s*[0-9]+' | grep -oE '[0-9]+$')
+        fi
     fi
-fi
-actual_count=$(echo "$computers_list" | grep -o '"totalCount" : [0-9]*' | grep -o '[0-9]*')
+
+    # No more results on this page -> stop paging
+    if [[ -z "$page_ids" ]]; then
+        break
+    fi
+
+    computer_ids="${computer_ids}${page_ids}
+"
+
+    fetched_so_far=$(echo "$computer_ids" | grep -v '^$' | sort -u | wc -l | tr -d ' ')
+    if [[ -n "$actual_count" ]] && [[ "$fetched_so_far" -ge "$actual_count" ]]; then
+        break
+    fi
+
+    ((page++))
+done
+
+computer_ids=$(echo "$computer_ids" | sort -u)
 
 # Check actual ID count
 unique_id_count=$(echo "$computer_ids" | grep -v '^$' | wc -l | tr -d ' ')
