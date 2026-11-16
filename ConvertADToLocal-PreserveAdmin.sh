@@ -75,6 +75,13 @@ PasswordMigration() {
     # Remove LocalCachedUser and ALL Kerberosv5 entries (AD + LKDC), keep ShadowHash/SecureToken.
     # Index-based xpath: no sed, values with spaces (/Active Directory/...) stay intact.
     aa=$(/usr/bin/dscl -plist . -read /Users/"$username" AuthenticationAuthority)
+
+    # Abort before any change if there is no local ShadowHash (user would be locked out)
+    if [[ "$aa" != *";ShadowHash;"* ]]; then
+        log "ERROR: No ShadowHash found for $username, aborting to avoid lockout."
+        return 1
+    fi
+
     count=$(echo "$aa" | xmllint --xpath 'count(//string)' - 2>/dev/null)
     count=${count%%.*}
 
@@ -140,6 +147,10 @@ ConvertUser() {
         log "$username has FileVault access"
     fi
 
+    # Only remove Kerberos and LocalCachedUser entries, do not touch ShadowHash
+    # Runs first: aborts before any change if ShadowHash is missing
+    PasswordMigration "$username" || return 1
+
     log "Removing AD attributes for $username"
     for attr in cached_groups cached_auth_policy CopyTimestamp AltSecurityIdentities \
         SMBPrimaryGroupSID OriginalAuthenticationAuthority OriginalNodeName SMBSID \
@@ -150,9 +161,6 @@ ConvertUser() {
         JobTitle PhoneNumber Street; do
         /usr/bin/dscl . -delete /Users/"$username" "$attr" 2>/dev/null
     done
-
-    # Only remove Kerberos and LocalCachedUser entries, do not touch ShadowHash
-    PasswordMigration "$username"
 
     [[ -n "$homedir" ]] && /bin/rm -f "$homedir/.account"
 
